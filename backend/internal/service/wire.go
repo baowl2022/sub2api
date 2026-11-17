@@ -1029,10 +1029,11 @@ func ProvideBalanceNotifyService(emailService *EmailService, settingRepo Setting
 func ProvidePaymentFXSyncService(
 	settingRepo SettingRepository,
 	paymentConfigSvc *PaymentConfigService,
+	adminService AdminService,
 	leaderLockCache LeaderLockCache,
 	db *sql.DB,
 ) *PaymentFXSyncService {
-	svc := NewPaymentFXSyncService(settingRepo, paymentConfigSvc, leaderLockCache, db)
+	svc := NewPaymentFXSyncService(settingRepo, paymentConfigSvc, adminService, leaderLockCache, db)
 	svc.Start()
 	return svc
 }

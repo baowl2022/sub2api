@@ -64,6 +64,97 @@
       <Toggle v-model="form.update_subscription_rate" />
     </div>
 
+    <div class="space-y-2 rounded-lg border border-gray-200 px-3 py-2 dark:border-dark-700">
+      <div>
+        <p class="text-sm font-medium">{{ t('admin.settings.payment.fxSync.modelPricesTitle') }}</p>
+        <p class="text-xs text-gray-400">{{ t('admin.settings.payment.fxSync.modelPricesHint') }}</p>
+      </div>
+      <div
+        v-for="(row, index) in modelPrices"
+        :key="index"
+        data-test="model-price-row"
+        class="grid items-end gap-2 sm:grid-cols-[1fr_1fr_1fr_1fr_1fr_auto]"
+      >
+        <label class="block">
+          <span class="input-label">{{ t('admin.settings.payment.fxSync.modelPricesModel') }}</span>
+          <input
+            v-model="row.model"
+            data-test="model-price-model"
+            type="text"
+            class="input mt-1"
+            :disabled="loading || saving || syncing || !loaded"
+          />
+        </label>
+        <label class="block">
+          <span class="input-label">{{ t('admin.settings.payment.fxSync.modelPricesInput') }}</span>
+          <input
+            v-model.number="row.cny_input"
+            data-test="model-price-input"
+            type="number"
+            min="0"
+            step="0.0001"
+            class="input mt-1"
+            :disabled="loading || saving || syncing || !loaded"
+          />
+        </label>
+        <label class="block">
+          <span class="input-label">{{ t('admin.settings.payment.fxSync.modelPricesOutput') }}</span>
+          <input
+            v-model.number="row.cny_output"
+            data-test="model-price-output"
+            type="number"
+            min="0"
+            step="0.0001"
+            class="input mt-1"
+            :disabled="loading || saving || syncing || !loaded"
+          />
+        </label>
+        <label class="block">
+          <span class="input-label">{{ t('admin.settings.payment.fxSync.modelPricesCacheRead') }}</span>
+          <input
+            v-model.number="row.cny_cache_read"
+            data-test="model-price-cache"
+            type="number"
+            min="0"
+            step="0.0001"
+            class="input mt-1"
+            :disabled="loading || saving || syncing || !loaded"
+          />
+        </label>
+        <label class="block">
+          <span class="input-label">{{ t('admin.settings.payment.fxSync.modelPricesGroups') }}</span>
+          <select
+            v-model="row.group_ids"
+            data-test="model-price-groups"
+            multiple
+            size="3"
+            class="input mt-1"
+            :disabled="loading || saving || syncing || !loaded"
+          >
+            <option v-for="group in groups" :key="group.id" :value="group.id">{{ group.name }}</option>
+          </select>
+        </label>
+        <button
+          type="button"
+          data-test="model-price-remove"
+          class="btn btn-secondary"
+          :disabled="loading || saving || syncing || !loaded"
+          @click="modelPrices.splice(index, 1)"
+        >
+          {{ t('admin.settings.payment.fxSync.modelPricesRemove') }}
+        </button>
+      </div>
+      <button
+        type="button"
+        data-test="model-price-add"
+        class="btn btn-secondary"
+        :disabled="loading || saving || syncing || !loaded"
+        @click="addModelPrice"
+      >
+        {{ t('admin.settings.payment.fxSync.modelPricesAdd') }}
+      </button>
+    </div>
+
     <div class="flex flex-wrap gap-2">
       <button type="button" data-test="save" class="btn btn-primary" :disabled="loading || saving || syncing || !loaded" @click="save">
         {{ saving ? t('admin.settings.payment.fxSync.saving') : t('admin.settings.payment.fxSync.save') }}
@@ -99,8 +190,10 @@ import {
   getPaymentFXSyncConfig,
   syncPaymentFXNow,
   updatePaymentFXSyncConfig,
+  type PaymentFXModelPrice,
   type PaymentFXSyncConfig,
 } from '@/api/admin/paymentFx'
+import { getAllIncludingInactive } from '@/api/admin/groups'
 
 const { t } = useI18n()
 
@@ -111,6 +204,8 @@ const form = reactive({
   update_subscription_rate: false,
 })
 const urlsText = ref('')
+const modelPrices = ref<PaymentFXModelPrice[]>([])
+const groups = ref<{ id: number; name: string }[]>([])
 const status = ref<PaymentFXSyncConfig | null>(null)
 const loading = ref(true)
 const loaded = ref(false)
@@ -133,7 +228,39 @@ function applyConfig(cfg: PaymentFXSyncConfig) {
   form.markup_percent = cfg.markup_percent || 0
   form.update_subscription_rate = cfg.update_subscription_rate
   urlsText.value = (cfg.urls || []).join('\n')
+  modelPrices.value = (cfg.model_prices || []).map((entry) => ({
+    model: entry.model,
+    cny_input: entry.cny_input,
+    cny_output: entry.cny_output,
+    cny_cache_read: entry.cny_cache_read || 0,
+    group_ids: [...(entry.group_ids || [])],
+  }))
   loaded.value = true
+}
+
+function addModelPrice() {
+  modelPrices.value.push({ model: '', cny_input: 0, cny_output: 0, cny_cache_read: 0, group_ids: [] })
+}
+
+function collectModelPrices(): PaymentFXModelPrice[] | null {
+  const entries: PaymentFXModelPrice[] = []
+  for (const row of modelPrices.value) {
+    const model = row.model.trim()
+    const input = Number(row.cny_input)
+    const output = Number(row.cny_output)
+    const cacheRead = Number(row.cny_cache_read || 0)
+    if (
+      !model ||
+      !Number.isFinite(input) || input <= 0 ||
+      !Number.isFinite(output) || output <= 0 ||
+      !Number.isFinite(cacheRead) || cacheRead < 0 ||
+      row.group_ids.length === 0
+    ) {
+      return null
+    }
+    entries.push({ model, cny_input: input, cny_output: output, cny_cache_read: cacheRead, group_ids: [...row.group_ids] })
+  }
+  return entries
 }
 
 async function load() {
@@ -146,6 +273,11 @@ async function load() {
     error.value = extractApiErrorMessage(err, t('admin.settings.payment.fxSync.loadFailed'))
   } finally {
     loading.value = false
+  }
+  try {
+    groups.value = (await getAllIncludingInactive()).map((group) => ({ id: group.id, name: group.name }))
+  } catch {
+    // Group options are best-effort; the config editor still works without them.
   }
 }
 
@@ -167,6 +299,11 @@ async function save() {
     error.value = t('admin.settings.payment.fxSync.invalidMarkup')
     return
   }
+  const entries = collectModelPrices()
+  if (entries === null) {
+    error.value = t('admin.settings.payment.fxSync.modelPricesInvalid')
+    return
+  }
 
   saving.value = true
   try {
@@ -176,6 +313,7 @@ async function save() {
       interval_hours: interval,
       markup_percent: Math.round(markup * 100) / 100,
       update_subscription_rate: form.update_subscription_rate,
+      model_prices: entries,
     })
     applyConfig(cfg)
     notice.value = t('admin.settings.payment.fxSync.saved')

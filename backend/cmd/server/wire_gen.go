@@ -287,7 +287,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	promptService := securityaudit.NewPromptService(configManager, postgreSQLRepository, redisPayloadStore, openAICompatibleScanner, atomicMetrics)
 	promptAdminHandler := securityaudit.NewPromptAdminHandler(promptService)
 	paymentHandler := admin.NewPaymentHandler(paymentService, paymentConfigService)
-	paymentFXSyncService := service.ProvidePaymentFXSyncService(settingRepository, paymentConfigService, leaderLockCache, db)
+	paymentFXSyncService := service.ProvidePaymentFXSyncService(settingRepository, paymentConfigService, adminService, leaderLockCache, db)
 	paymentFXHandler := admin.NewPaymentFXHandler(paymentFXSyncService)
 	affiliateHandler := admin.NewAffiliateHandler(affiliateService, adminService)
 	complianceHandler := admin.NewComplianceHandler(settingService)

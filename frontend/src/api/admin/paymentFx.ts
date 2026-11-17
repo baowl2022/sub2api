@@ -5,12 +5,21 @@
 
 import { apiClient } from '../client'
 
+export interface PaymentFXModelPrice {
+  model: string
+  cny_input: number
+  cny_output: number
+  cny_cache_read?: number
+  group_ids: number[]
+}
+
 export interface PaymentFXSyncConfig {
   enabled: boolean
   urls: string[]
   interval_hours: number
   markup_percent: number
   update_subscription_rate: boolean
+  model_prices?: PaymentFXModelPrice[]
   last_attempt_at?: string
   last_success_at?: string
   last_rate?: number
@@ -27,6 +36,7 @@ export interface UpdatePaymentFXSyncRequest {
   interval_hours: number
   markup_percent: number
   update_subscription_rate: boolean
+  model_prices: PaymentFXModelPrice[]
 }
 
 export async function getPaymentFXSyncConfig(): Promise<PaymentFXSyncConfig> {

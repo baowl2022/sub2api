@@ -26,6 +26,7 @@ const (
 	SettingPaymentFXSyncMarkupPercent = "PAYMENT_FX_SYNC_MARKUP_PERCENT"
 
 	SettingPaymentFXSyncUpdateSubscriptionRate = "PAYMENT_FX_SYNC_UPDATE_SUBSCRIPTION_RATE"
+	SettingPaymentFXSyncModelPrices            = "PAYMENT_FX_SYNC_MODEL_PRICES"
 
 	SettingPaymentFXSyncLastAttemptAt        = "PAYMENT_FX_SYNC_LAST_ATTEMPT_AT"
 	SettingPaymentFXSyncLastSuccessAt        = "PAYMENT_FX_SYNC_LAST_SUCCESS_AT"
@@ -41,6 +42,9 @@ const (
 	minPaymentFXSyncIntervalHours     = 1
 	maxPaymentFXSyncIntervalHours     = 168
 	maxPaymentFXSyncURLs              = 10
+	maxPaymentFXSyncModelPrices       = 100
+	maxPaymentFXSyncModelPriceGroups  = 100
+	maxPaymentFXSyncCNYPrice          = 1e9
 
 	paymentFXSyncCheckInterval = time.Minute
 	paymentFXSyncInitialDelay  = 30 * time.Second
@@ -61,13 +65,25 @@ var (
 	ErrPaymentFXSyncInProgress  = infraerrors.Conflict("PAYMENT_FX_SYNC_IN_PROGRESS", "an FX sync is already running")
 )
 
+// PaymentFXModelPrice pins a model's official domestic CNY price (per 1M tokens)
+// so every sync recomputes the USD group pricing cards at the live FX rate.
+// CNYCacheRead == 0 leaves the cache-read price untouched.
+type PaymentFXModelPrice struct {
+	Model        string  `json:"model"`
+	CNYInput     float64 `json:"cny_input"`
+	CNYOutput    float64 `json:"cny_output"`
+	CNYCacheRead float64 `json:"cny_cache_read,omitempty"`
+	GroupIDs     []int64 `json:"group_ids"`
+}
+
 // PaymentFXSyncConfig is both the admin configuration and the latest sync state.
 type PaymentFXSyncConfig struct {
-	Enabled                bool     `json:"enabled"`
-	URLs                   []string `json:"urls"`
-	IntervalHours          int      `json:"interval_hours"`
-	MarkupPercent          float64  `json:"markup_percent"`
-	UpdateSubscriptionRate bool     `json:"update_subscription_rate"`
+	Enabled                bool                  `json:"enabled"`
+	URLs                   []string              `json:"urls"`
+	IntervalHours          int                   `json:"interval_hours"`
+	MarkupPercent          float64               `json:"markup_percent"`
+	UpdateSubscriptionRate bool                  `json:"update_subscription_rate"`
+	ModelPrices            []PaymentFXModelPrice `json:"model_prices"`
 
 	LastAttemptAt        string  `json:"last_attempt_at,omitempty"`
 	LastSuccessAt        string  `json:"last_success_at,omitempty"`
@@ -81,11 +97,12 @@ type PaymentFXSyncConfig struct {
 
 // UpdatePaymentFXSyncRequest replaces the full FX sync configuration.
 type UpdatePaymentFXSyncRequest struct {
-	Enabled                bool     `json:"enabled"`
-	URLs                   []string `json:"urls"`
-	IntervalHours          int      `json:"interval_hours"`
-	MarkupPercent          float64  `json:"markup_percent"`
-	UpdateSubscriptionRate bool     `json:"update_subscription_rate"`
+	Enabled                bool                  `json:"enabled"`
+	URLs                   []string              `json:"urls"`
+	IntervalHours          int                   `json:"interval_hours"`
+	MarkupPercent          float64               `json:"markup_percent"`
+	UpdateSubscriptionRate bool                  `json:"update_subscription_rate"`
+	ModelPrices            []PaymentFXModelPrice `json:"model_prices"`
 }
 
 // PaymentFXSyncService periodically fetches a USD/CNY FX rate and updates the
@@ -94,6 +111,7 @@ type UpdatePaymentFXSyncRequest struct {
 type PaymentFXSyncService struct {
 	settingRepo      SettingRepository
 	paymentConfigSvc *PaymentConfigService
+	adminService     AdminService
 	leaderLockCache  LeaderLockCache
 	db               *sql.DB
 
@@ -113,12 +131,14 @@ type PaymentFXSyncService struct {
 func NewPaymentFXSyncService(
 	settingRepo SettingRepository,
 	paymentConfigSvc *PaymentConfigService,
+	adminService AdminService,
 	leaderLockCache LeaderLockCache,
 	db *sql.DB,
 ) *PaymentFXSyncService {
 	return &PaymentFXSyncService{
 		settingRepo:      settingRepo,
 		paymentConfigSvc: paymentConfigSvc,
+		adminService:     adminService,
 		leaderLockCache:  leaderLockCache,
 		db:               db,
 		httpClient:       newSSRFSafeHTTPClient(15 * time.Second),
@@ -214,12 +234,22 @@ func (s *PaymentFXSyncService) UpdateConfig(ctx context.Context, req UpdatePayme
 	}
 	markup = math.Round(markup*100) / 100
 
+	modelPrices, err := normalizePaymentFXModelPrices(req.ModelPrices)
+	if err != nil {
+		return nil, err
+	}
+	modelPricesJSON, err := json.Marshal(modelPrices)
+	if err != nil {
+		return nil, fmt.Errorf("encode model prices: %w", err)
+	}
+
 	values := map[string]string{
 		SettingPaymentFXSyncEnabled:                formatBoolString(req.Enabled),
 		SettingPaymentFXSyncURLs:                   strings.Join(urls, "\n"),
 		SettingPaymentFXSyncIntervalHours:          strconv.Itoa(interval),
 		SettingPaymentFXSyncMarkupPercent:          strconv.FormatFloat(markup, 'f', -1, 64),
 		SettingPaymentFXSyncUpdateSubscriptionRate: formatBoolString(req.UpdateSubscriptionRate),
+		SettingPaymentFXSyncModelPrices:            string(modelPricesJSON),
 	}
 	if err := s.settingRepo.SetMultiple(ctx, values); err != nil {
 		return nil, fmt.Errorf("save payment FX sync settings: %w", err)
@@ -318,6 +348,13 @@ func (s *PaymentFXSyncService) syncOnce(ctx context.Context, cfg *PaymentFXSyncC
 	if err := s.paymentConfigSvc.UpdatePaymentConfig(ctx, update); err != nil {
 		s.recordFailure(ctx, startedAt, err)
 		return err
+	}
+
+	if len(cfg.ModelPrices) > 0 {
+		if err := s.applyModelPrices(ctx, cfg.ModelPrices, effectiveRate); err != nil {
+			s.recordFailure(ctx, startedAt, err)
+			return err
+		}
 	}
 
 	status := map[string]string{
@@ -451,6 +488,7 @@ func parsePaymentFXSyncConfig(vals map[string]string) *PaymentFXSyncConfig {
 		IntervalHours:          pcParseInt(vals[SettingPaymentFXSyncIntervalHours], defaultPaymentFXSyncIntervalHours),
 		MarkupPercent:          pcParseFloat(vals[SettingPaymentFXSyncMarkupPercent], 0),
 		UpdateSubscriptionRate: vals[SettingPaymentFXSyncUpdateSubscriptionRate] == "true",
+		ModelPrices:            parsePaymentFXModelPrices(vals[SettingPaymentFXSyncModelPrices]),
 		LastAttemptAt:          strings.TrimSpace(vals[SettingPaymentFXSyncLastAttemptAt]),
 		LastSuccessAt:          strings.TrimSpace(vals[SettingPaymentFXSyncLastSuccessAt]),
 		LastRate:               pcParseFloat(vals[SettingPaymentFXSyncLastRate], 0),
@@ -475,6 +513,7 @@ func paymentFXSyncKeys() []string {
 		SettingPaymentFXSyncIntervalHours,
 		SettingPaymentFXSyncMarkupPercent,
 		SettingPaymentFXSyncUpdateSubscriptionRate,
+		SettingPaymentFXSyncModelPrices,
 		SettingPaymentFXSyncLastAttemptAt,
 		SettingPaymentFXSyncLastSuccessAt,
 		SettingPaymentFXSyncLastRate,
@@ -517,6 +556,161 @@ func normalizePaymentFXSyncURLs(raw []string) ([]string, error) {
 		}
 	}
 	return urls, nil
+}
+
+func normalizePaymentFXModelPrices(entries []PaymentFXModelPrice) ([]PaymentFXModelPrice, error) {
+	if len(entries) > maxPaymentFXSyncModelPrices {
+		return nil, infraerrors.BadRequest("PAYMENT_FX_SYNC_TOO_MANY_MODEL_PRICES", fmt.Sprintf("at most %d model price entries are allowed", maxPaymentFXSyncModelPrices))
+	}
+	out := make([]PaymentFXModelPrice, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		model := strings.TrimSpace(entry.Model)
+		if model == "" {
+			return nil, infraerrors.BadRequest("PAYMENT_FX_SYNC_MODEL_REQUIRED", "model price entry requires a model name")
+		}
+		if _, ok := seen[model]; ok {
+			return nil, infraerrors.BadRequest("PAYMENT_FX_SYNC_MODEL_DUPLICATE", fmt.Sprintf("duplicate model price entry: %s", model))
+		}
+		seen[model] = struct{}{}
+		if !validPaymentFXCNYPrice(entry.CNYInput) || !validPaymentFXCNYPrice(entry.CNYOutput) {
+			return nil, infraerrors.BadRequest("PAYMENT_FX_SYNC_INVALID_MODEL_PRICE", fmt.Sprintf("model %s: cny_input and cny_output must be positive finite numbers", model))
+		}
+		if entry.CNYCacheRead != 0 && !validPaymentFXCNYPrice(entry.CNYCacheRead) {
+			return nil, infraerrors.BadRequest("PAYMENT_FX_SYNC_INVALID_MODEL_PRICE", fmt.Sprintf("model %s: cny_cache_read must be a positive finite number or 0", model))
+		}
+		groupIDs := make([]int64, 0, len(entry.GroupIDs))
+		seenGroups := make(map[int64]struct{}, len(entry.GroupIDs))
+		for _, id := range entry.GroupIDs {
+			if id <= 0 {
+				return nil, infraerrors.BadRequest("PAYMENT_FX_SYNC_INVALID_MODEL_GROUP", fmt.Sprintf("model %s: group IDs must be positive", model))
+			}
+			if _, ok := seenGroups[id]; ok {
+				continue
+			}
+			seenGroups[id] = struct{}{}
+			groupIDs = append(groupIDs, id)
+		}
+		if len(groupIDs) == 0 {
+			return nil, infraerrors.BadRequest("PAYMENT_FX_SYNC_MODEL_GROUP_REQUIRED", fmt.Sprintf("model %s: at least one group is required", model))
+		}
+		if len(groupIDs) > maxPaymentFXSyncModelPriceGroups {
+			return nil, infraerrors.BadRequest("PAYMENT_FX_SYNC_TOO_MANY_MODEL_GROUPS", fmt.Sprintf("model %s: at most %d groups are allowed", model, maxPaymentFXSyncModelPriceGroups))
+		}
+		out = append(out, PaymentFXModelPrice{
+			Model:        model,
+			CNYInput:     entry.CNYInput,
+			CNYOutput:    entry.CNYOutput,
+			CNYCacheRead: entry.CNYCacheRead,
+			GroupIDs:     groupIDs,
+		})
+	}
+	return out, nil
+}
+
+func validPaymentFXCNYPrice(v float64) bool {
+	return v > 0 && !math.IsNaN(v) && !math.IsInf(v, 0) && v <= maxPaymentFXSyncCNYPrice
+}
+
+func parsePaymentFXModelPrices(raw string) []PaymentFXModelPrice {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var entries []PaymentFXModelPrice
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		return nil
+	}
+	normalized, err := normalizePaymentFXModelPrices(entries)
+	if err != nil {
+		return nil
+	}
+	return normalized
+}
+
+// paymentFXCNYToTokenPrice converts an official CNY price per 1M tokens into a
+// USD per-token price: round the per-1M USD amount to 6 decimals first, then
+// scale down, so the displayed official price keeps 6-decimal precision.
+func paymentFXCNYToTokenPrice(cnyPerMillion, effectiveRate float64) float64 {
+	usdPerMillion := math.Round(cnyPerMillion/effectiveRate*1e6) / 1e6
+	return usdPerMillion / 1e6
+}
+
+// applyModelPrices upserts the FX-linked pricing cards on every referenced
+// group. Groups touched by several entries are written once.
+func (s *PaymentFXSyncService) applyModelPrices(ctx context.Context, entries []PaymentFXModelPrice, effectiveRate float64) error {
+	if s.adminService == nil {
+		return fmt.Errorf("model price sync requires the group admin service")
+	}
+	type groupUpdate struct {
+		pricing []ChannelModelPricing
+	}
+	updates := make(map[int64]*groupUpdate)
+	errs := make([]string, 0)
+	for _, entry := range entries {
+		input := paymentFXCNYToTokenPrice(entry.CNYInput, effectiveRate)
+		output := paymentFXCNYToTokenPrice(entry.CNYOutput, effectiveRate)
+		var cacheRead *float64
+		if entry.CNYCacheRead > 0 {
+			v := paymentFXCNYToTokenPrice(entry.CNYCacheRead, effectiveRate)
+			cacheRead = &v
+		}
+		for _, groupID := range entry.GroupIDs {
+			update, ok := updates[groupID]
+			if !ok {
+				group, err := s.adminService.GetGroup(ctx, groupID)
+				if err != nil {
+					errs = append(errs, fmt.Sprintf("group %d: %v", groupID, err))
+					continue
+				}
+				pricing := make([]ChannelModelPricing, len(group.ModelPricing))
+				for i := range group.ModelPricing {
+					pricing[i] = group.ModelPricing[i].Clone()
+				}
+				update = &groupUpdate{pricing: pricing}
+				updates[groupID] = update
+			}
+			update.pricing = upsertPaymentFXModelCard(update.pricing, entry.Model, input, output, cacheRead)
+		}
+	}
+	for groupID, update := range updates {
+		if _, err := s.adminService.UpdateGroup(ctx, groupID, &UpdateGroupInput{ModelPricing: &update.pricing}); err != nil {
+			errs = append(errs, fmt.Sprintf("group %d: %v", groupID, err))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("update model prices: %s", strings.Join(errs, "; "))
+	}
+	logger.LegacyPrintf("service.payment_fx_sync", "[PaymentFXSync] refreshed FX-linked model prices on %d group(s)", len(updates))
+	return nil
+}
+
+// upsertPaymentFXModelCard updates the token-billing card covering the model,
+// or appends a dedicated single-model card. Other cards and fields stay intact.
+func upsertPaymentFXModelCard(pricing []ChannelModelPricing, model string, input, output float64, cacheRead *float64) []ChannelModelPricing {
+	for i := range pricing {
+		if pricing[i].BillingMode != "" && pricing[i].BillingMode != BillingModeToken {
+			continue
+		}
+		for _, name := range pricing[i].Models {
+			if name != model {
+				continue
+			}
+			pricing[i].InputPrice = &input
+			pricing[i].OutputPrice = &output
+			if cacheRead != nil {
+				pricing[i].CacheReadPrice = cacheRead
+			}
+			return pricing
+		}
+	}
+	return append(pricing, ChannelModelPricing{
+		Models:         []string{model},
+		BillingMode:    BillingModeToken,
+		InputPrice:     &input,
+		OutputPrice:    &output,
+		CacheReadPrice: cacheRead,
+	})
 }
 
 func paymentFXSyncDue(cfg *PaymentFXSyncConfig, now time.Time) bool {

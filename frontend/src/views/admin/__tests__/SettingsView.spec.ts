@@ -142,6 +142,14 @@ vi.mock("@/api/admin/paymentFx", () => ({
   syncPaymentFXNow: vi.fn(),
 }));
 
+vi.mock("@/api/admin/groups", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/api/admin/groups")>();
+  return {
+    ...actual,
+    getAllIncludingInactive: vi.fn().mockResolvedValue([]),
+  };
+});
+
 vi.mock("@/stores/adminSettings", () => ({
   useAdminSettingsStore: () => ({
     fetch: adminSettingsFetch,
